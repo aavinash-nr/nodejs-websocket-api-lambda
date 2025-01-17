@@ -1,0 +1,4 @@
+.aws-sam
+*.toml
+node_modules
+.env

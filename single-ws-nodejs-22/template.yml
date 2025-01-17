@@ -1,0 +1,187 @@
+
+AWSTemplateFormatVersion: 2010-09-09
+Transform: 'AWS::Serverless-2016-10-31'
+Description: A simplified WebSocket API with a single Lambda function handling all events.
+
+Globals:
+  Function:
+    CodeUri: ./src
+    Runtime: nodejs22.x
+    MemorySize: 128
+    Timeout: 15
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Amazon DynamoDB Configuration"
+        Parameters:
+          - WebSocketConnectionsTableNameSuffix
+          - ReadCapacityUnits
+          - WriteCapacityUnits
+    ParameterLabels:
+      ReadCapacityUnits:
+        default: Read Capacity Units
+      WriteCapacityUnits:
+        default: Write Capacity Units
+      WebSocketConnectionsTableNameSuffix:
+        default: WebSocket Connections Table Name Suffix
+
+Parameters:
+  WebSocketConnectionsTableNameSuffix:
+    Type: String
+    Default: 'websocket_connections'
+    Description: >
+      Suffix for the Amazon DynamoDB table where connection identifiers will be stored.
+      The table name will be prefixed by the Stack Name.
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: ^[A-Za-z_]+$
+    ConstraintDescription: 'Required. Can be characters and underscore only. No numbers or special characters allowed.'
+  ReadCapacityUnits:
+    Description: Provisioned read throughput
+    Type: Number
+    Default: 5
+    MinValue: 5
+    MaxValue: 10000
+    ConstraintDescription: Must be between 5 and 10000
+  WriteCapacityUnits:
+    Description: Provisioned write throughput
+    Type: Number
+    Default: 5
+    MinValue: 5
+    MaxValue: 10000
+    ConstraintDescription: Must be between 5 and 10000
+
+Resources:
+  # API Gateway WebSocket API
+  WebSocketApi:
+    Type: 'AWS::ApiGatewayV2::Api'
+    Properties:
+      Name: !Ref AWS::StackName
+      Description: A WebSocket API with a single Lambda function.
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  # Single Lambda Function
+  WebSocketHandlerFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-websocket-handler'
+      Handler: index.handler
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref WebSocketConnectionsTableName
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WebSocketConnectionsTableName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - 'execute-api:ManageConnections'
+              Resource:
+                - !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  # Function permissions
+  WebSocketHandlerFunctionPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      FunctionName: !Ref WebSocketHandlerFunction
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  # Integration for Lambda Function
+  WebSocketIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      Description: WebSocket Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::Sub:
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketHandlerFunction.Arn}/invocations
+
+  # WebSocket Routes
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      AuthorizationType: NONE
+      OperationName: ConnectRoute
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref WebSocketIntegration
+
+  PostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: post
+      AuthorizationType: NONE
+      OperationName: PostRoute
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref WebSocketIntegration
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      OperationName: DisconnectRoute
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref WebSocketIntegration
+
+  # DynamoDB Table
+  WebSocketConnectionsTableName:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref ReadCapacityUnits
+        WriteCapacityUnits: !Ref WriteCapacityUnits
+      TableName:
+        !Sub
+          - ${AWS::StackName}-${TableNameSuffix}
+          - { TableNameSuffix: !Ref WebSocketConnectionsTableNameSuffix }
+
+  Deployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - ConnectRoute
+      - PostRoute
+      - DisconnectRoute
+    Properties:
+      ApiId: !Ref WebSocketApi
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: prod
+      Description: Prod Stage
+      DeploymentId: !Ref Deployment
+      ApiId: !Ref WebSocketApi
+
+Outputs:
+  WebSocketHandlerFunctionArn:
+    Description: "WebSocket handler function ARN"
+    Value: !GetAtt WebSocketHandlerFunction.Arn
+  WebSocketURL:
+    Description: "The WSS Protocol URL to connect to"
+    Value: !Join [ '', [ 'wss://', !Ref WebSocketApi, '.execute-api.',!Ref 'AWS::Region','.amazonaws.com/',!Ref 'Stage'] ]
+  WebSocketConnectionsTableNameArn:
+    Description: "WebSocket connections table ARN"
+    Value: !GetAtt WebSocketConnectionsTableName.Arn
